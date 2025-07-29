@@ -1,17 +1,29 @@
 package io.gitlab.arturbosch.detekt.rules.coroutines
 
 import com.intellij.psi.PsiElement
+import com.intellij.psi.util.parentOfType
 import dev.detekt.api.Config
 import dev.detekt.api.Entity
 import dev.detekt.api.Finding
+import dev.detekt.api.RequiresAnalysisApi
 import dev.detekt.api.RequiresFullAnalysis
 import dev.detekt.api.Rule
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.resolution.KaFunctionCall
+import org.jetbrains.kotlin.analysis.api.resolution.singleVariableAccessCall
+import org.jetbrains.kotlin.analysis.api.resolution.successfulFunctionCallOrNull
+import org.jetbrains.kotlin.analysis.api.resolution.symbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaNamedFunctionSymbol
+import org.jetbrains.kotlin.analysis.api.symbols.typeParameters
+import org.jetbrains.kotlin.analysis.api.types.symbol
 import org.jetbrains.kotlin.builtins.StandardNames.COROUTINES_PACKAGE_FQ_NAME
 import org.jetbrains.kotlin.descriptors.DeclarationDescriptorWithSource
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.descriptors.PropertyDescriptor
+import org.jetbrains.kotlin.idea.references.mainReference
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
+import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtCatchClause
 import org.jetbrains.kotlin.psi.KtElement
@@ -35,6 +47,8 @@ import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameOrNull
 import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameSafe
 import org.jetbrains.kotlin.resolve.source.getPsi
 import org.jetbrains.kotlin.utils.addToStdlib.ifTrue
+import kotlin.math.abs
+import kotlin.math.exp
 
 /**
  * `suspend` functions should not be called inside `runCatching`'s lambda block, because `runCatching` catches all the
@@ -124,14 +138,19 @@ class SuspendFunSwallowedCancellation(config: Config) :
         description = "`CancellationException` must be specially handled and re-thrown when working with exceptions " +
             "in a suspending context. This includes `runCatching` as well as regular try-catch blocks."
     ),
-    RequiresFullAnalysis {
+    RequiresAnalysisApi {
 
     override fun visitCallExpression(expression: KtCallExpression) {
         super.visitCallExpression(expression)
 
-        val resultingDescriptor = expression.getResolvedCall(bindingContext)?.resultingDescriptor ?: return
+        val callableId = analyze(expression) {
+            expression.resolveToCall()
+                ?.successfulFunctionCallOrNull()
+                ?.symbol
+                ?.callableId
+        } ?: return
 
-        if (resultingDescriptor.fqNameSafe != RUN_CATCHING_FQ) return
+        if (callableId.asSingleFqName() != RUN_CATCHING_FQ) return
 
         fun shouldTraverseInside(element: PsiElement): Boolean =
             expression == element || shouldTraverseInside(element, bindingContext)
@@ -144,9 +163,15 @@ class SuspendFunSwallowedCancellation(config: Config) :
     override fun visitTryExpression(expression: KtTryExpression) {
         super.visitTryExpression(expression)
 
-        val function = expression.getParentOfType<KtFunction>(strict = true)
-        val functionDescriptor = bindingContext[BindingContext.FUNCTION, function]
-        if (functionDescriptor?.isSuspend != true) {
+        val functionSymbol = analyze(expression) {
+            val function = expression.getParentOfType<KtFunction>(strict = true)
+            function?.resolveToCall()
+                ?.successfulFunctionCallOrNull()
+                ?.symbol
+                as? KaNamedFunctionSymbol
+        }
+
+        if (functionSymbol?.isSuspend != true) {
             // Don't care about the try-catch block unless it's in a suspending context
             return
         }
@@ -211,9 +236,16 @@ class SuspendFunSwallowedCancellation(config: Config) :
             }
 
             is KtNameReferenceExpression -> {
-                val resolvedCall = getResolvedCall(bindingContext) ?: return false
-                val propertyDescriptor = resolvedCall.resultingDescriptor as? PropertyDescriptor
-                propertyDescriptor?.fqNameSafe == COROUTINE_CONTEXT_FQ_NAME
+                val fqName = analyze(this@hasSuspendCalls) {
+                    val expr: KtNameReferenceExpression = this@hasSuspendCalls
+                    expr.resolveToCall()
+                        ?.singleVariableAccessCall()
+                        ?.symbol
+                        ?.callableId
+                        ?.classId
+                        ?.asSingleFqName()
+                }
+                fqName == COROUTINE_CONTEXT_FQ_NAME
             }
 
             else -> {
@@ -223,13 +255,16 @@ class SuspendFunSwallowedCancellation(config: Config) :
     }
 
     private fun KtParameter.isCancellationExceptionOrSuperClass(): Boolean {
-        val parameterFqName = bindingContext[BindingContext.VALUE_PARAMETER, this]
-            ?.type
-            ?.constructor
-            ?.declarationDescriptor
-            ?.fqNameOrNull()
-            ?.asString()
-        return parameterFqName in CANCELLATION_EXCEPTION_FQ_NAMES
+        return analyze(this) {
+            val parameter = this@isCancellationExceptionOrSuperClass
+            val parameterFqName = parameter.typeReference
+                ?.type
+                ?.symbol
+                ?.classId
+                ?.asFqNameString()
+
+            parameterFqName in CANCELLATION_EXCEPTION_FQ_NAMES
+        }
     }
 
     /**
@@ -243,7 +278,11 @@ class SuspendFunSwallowedCancellation(config: Config) :
             .asSequence()
             .map { expr -> expr.thrownExpression }
             .filterIsInstance<KtNameReferenceExpression>()
-            .map { expr -> bindingContext[BindingContext.REFERENCE_TARGET, expr] }
+            .map { expr ->
+                analyze(expr) {
+                    expr.mainReference.resolveToSymbol()
+                }
+            }
             .filterIsInstance<DeclarationDescriptorWithSource>()
             .map { descriptor -> descriptor.source.getPsi() }
             .toList()
